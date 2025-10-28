@@ -1,11 +1,22 @@
-import streamlit as st 
+import streamlit as st
 import requests
 import pandas as pd
 from datetime import datetime
-import plotly.express as px
-import locale # Importado para formatar data
+import locale
 
-# Suprime os avisos de verificação de SSL
+# --- Constantes Globais ---
+
+# Fator de vantagem de 10% para o time da casa usado no cálculo de predição.
+HOME_ADVANTAGE = 1.10
+
+# ID da competição (BSA = Brasileirão Série A)
+COMPETITION_ID = "BSA"
+
+# Suprime os avisos de verificação de SSL.
+# ATENÇÃO: Desabilitar a verificação SSL (verify=False) é uma falha de segurança.
+# Isso é feito aqui para contornar problemas de certificado da API, 
+# mas expõe a conexão a ataques 'man-in-the-middle'.
+# Em um ambiente de produção, o ideal é corrigir o problema no servidor.
 requests.packages.urllib3.disable_warnings()
 
 # Configura o locale para Português-Brasil para formatar os dias da semana
@@ -22,41 +33,45 @@ except locale.Error:
 # Camada de Acesso a Dados (football-data.org)
 # -----------------------------------------------------------------------------
 class FootballAPIClient:
+    """
+    Cliente para interagir com a API api.football-data.org.
+    Gerencia a autenticação e o cache das requisições.
+    """
     BASE_URL = "https://api.football-data.org/v4"
+
     def __init__(self, api_key: str):
         self.headers = {"X-Auth-Token": api_key}
 
     def _make_request(self, endpoint, params=None):
+        """Método privado para executar chamadas GET na API."""
         try:
+            # Note: verify=False desabilita a verificação de certificado SSL.
             response = requests.get(f"{self.BASE_URL}/{endpoint}", headers=self.headers, params=params, verify=False)
             response.raise_for_status()
             return response.json()
         except requests.exceptions.RequestException as e:
             st.error(f"Erro de conexão com a API: {e}")
             return None
-    
-    # --- NOVO: Helper para processar listas de partidas ---
+
     def _process_matches_to_df(self, match_list):
         """Helper para processar lista de partidas crua (JSON) para DataFrame."""
         if not match_list:
             return pd.DataFrame()
-        
+
         processed_list = []
         for match in match_list:
             status = match.get('status')
-            
-            # Lida com estruturas de pontuação ausentes (jogos agendados)
             score = match.get('score', {})
             fullTime = score.get('fullTime', {})
-            
+
             processed_list.append({
-                'id': match['id'], 
-                'Rodada': match.get('matchday'), 
+                'id': match['id'],
+                'Rodada': match.get('matchday'),
                 'Data': match.get('utcDate'),
-                'Status': status, 
+                'Status': status,
                 'Mandante': match['homeTeam']['name'], 'Visitante': match['awayTeam']['name'],
                 'MandanteID': match['homeTeam']['id'], 'VisitanteID': match['awayTeam']['id'],
-                'Gols Mandante': fullTime.get('home'), 
+                'Gols Mandante': fullTime.get('home'),
                 'Gols Visitante': fullTime.get('away'),
                 'Vencedor': score.get('winner'),
                 'Estadio': match.get('venue'),
@@ -65,76 +80,78 @@ class FootballAPIClient:
         df = pd.DataFrame(processed_list)
         if df.empty: return pd.DataFrame()
         df['Data'] = pd.to_datetime(df['Data'], utc=True)
-        df['Rodada'] = df['Rodada'].fillna(0).astype(int) 
+        df['Rodada'] = df['Rodada'].fillna(0).astype(int)
         return df
 
     @st.cache_data(ttl=3600)
     def get_standings(_self, competition_id: str):
+        """Busca a tabela de classificação (cache de 1h)."""
         data = _self._make_request(f"competitions/{competition_id}/standings")
         if not data or not data.get('standings'): return pd.DataFrame()
         table = data['standings'][0]['table']
-        return pd.DataFrame([{'Pos': item['position'], 'Club': item['team']['crest'], 'Time': item['team']['name'], 
-                              'P': item['points'], 'J': item['playedGames'], 'V': item['won'], 'E': item['draw'], 'D': item['lost'], 
-                              'GF': item['goalsFor'], 'GC': item['goalsAgainst'], 'SG': item['goalDifference'], 
+        return pd.DataFrame([{'Pos': item['position'], 'Club': item['team']['crest'], 'Time': item['team']['name'],
+                              'P': item['points'], 'J': item['playedGames'], 'V': item['won'], 'E': item['draw'], 'D': item['lost'],
+                              'GF': item['goalsFor'], 'GC': item['goalsAgainst'], 'SG': item['goalDifference'],
                               'id': item['team']['id']} for item in table])
 
     @st.cache_data(ttl=3600)
     def get_scorers(_self, competition_id: str):
+        """Busca a lista de artilheiros (cache de 1h)."""
         data = _self._make_request(f"competitions/{competition_id}/scorers")
         if not data or not data.get('scorers'): return pd.DataFrame()
         player_stats = []
         for scorer in data.get('scorers', []):
             player_stats.append({
-                'Jogador': scorer['player']['name'], 'Time': scorer['team']['name'], 
-                'Gols': scorer.get('goals', 0), 'Assistências': scorer.get('assists', 0), 
+                'Jogador': scorer['player']['name'], 'Time': scorer['team']['name'],
+                'Gols': scorer.get('goals', 0), 'Assistências': scorer.get('assists', 0),
                 'Pênaltis': scorer.get('penalties', 0),
             })
         return pd.DataFrame(player_stats)
-    
+
     @st.cache_data(ttl=300)
     def get_head2head(_self, team1_id: int, team2_id: int):
-        
+        """Busca o histórico de confrontos (H2H) entre dois times (cache de 5min)."""
         data1 = _self._make_request(f"teams/{team1_id}/matches?opponent={team2_id}")
         data2 = _self._make_request(f"teams/{team2_id}/matches?opponent={team1_id}")
-        
+
         matches1 = data1.get('matches', []) if data1 else []
         matches2 = data2.get('matches', []) if data2 else []
-        
+
         # Combinar e de-duplicar usando o ID da partida
         all_matches_dict = {match['id']: match for match in matches1}
         for match in matches2:
             if match['id'] not in all_matches_dict:
                 all_matches_dict[match['id']] = match
-                
+
         return list(all_matches_dict.values())
 
     @st.cache_data(ttl=300)
     def get_matches(_self, competition_id: str):
-        # MODIFICADO: Usa o helper para processar
+        """Busca todas as partidas da competição (cache de 5min)."""
         data = _self._make_request(f"competitions/{competition_id}/matches")
-        if not data or not data.get('matches'): 
+        if not data or not data.get('matches'):
             return pd.DataFrame()
         return _self._process_matches_to_df(data.get('matches', []))
-    
-    # --- NOVO: Método para buscar partidas de um time específico ---
+
     @st.cache_data(ttl=300)
     def get_team_matches(_self, team_id: int):
+        """Busca todas as partidas de um time específico (cache de 5min)."""
         data = _self._make_request(f"teams/{team_id}/matches")
-        if not data or not data.get('matches'): 
+        if not data or not data.get('matches'):
             return pd.DataFrame()
-        # Usa o helper para processar e retornar um DataFrame
         return _self._process_matches_to_df(data.get('matches', []))
 
 # -----------------------------------------------------------------------------
-# Função: Métricas Principais (Sem alterações)
+# Renderização: Métricas Principais
 # -----------------------------------------------------------------------------
 def page_key_metrics(client, competition_id):
-    st.subheader("📊 Estatísticas Gerais", anchor=False) 
-    
+    """Exibe os 4 cards de métricas principais (Líder, Artilheiro, etc.)."""
+    st.subheader("📊 Estatísticas Gerais", anchor=False)
+
     with st.spinner("Carregando estatísticas..."):
         standings_data = client.get_standings(competition_id)
         scorers_data = client.get_scorers(competition_id)
-    
+
     if standings_data.empty: st.warning("Não foi possível carregar as estatísticas de classificação."); return
     if scorers_data.empty: st.warning("Não foi possível carregar as estatísticas de artilharia."); return
 
@@ -142,15 +159,15 @@ def page_key_metrics(client, competition_id):
         lider = standings_data.iloc[0]
         lider_nome = lider['Time']
         lider_pontos = f"{lider['P']} pontos"
-        
+
         artilheiro = scorers_data.sort_values(by='Gols', ascending=False).iloc[0]
         artilheiro_nome = artilheiro['Jogador']
         artilheiro_gols = f"{artilheiro['Gols']} gols"
-        
+
         melhor_ataque = standings_data.sort_values(by='GF', ascending=False).iloc[0]
         ataque_nome = melhor_ataque['Time']
         ataque_gols = f"{melhor_ataque['GF']} gols marcados"
-        
+
         melhor_defesa = standings_data.sort_values(by='GC', ascending=True).iloc[0]
         defesa_nome = melhor_defesa['Time']
         defesa_gols = f"{melhor_defesa['GC']} gols sofridos"
@@ -166,9 +183,10 @@ def page_key_metrics(client, competition_id):
     with col4: st.metric(label="🛡️ Melhor Defesa", value=defesa_nome, delta=defesa_gols)
 
 # -----------------------------------------------------------------------------
-# PÁGINA DE CLASSIFICAÇÃO (Sem alterações)
+# Renderização: Página de Classificação
 # -----------------------------------------------------------------------------
 def style_position(pos):
+    """Aplica estilo CSS à coluna 'Pos' da tabela de classificação."""
     if pos <= 4: return 'background-color: #1DB954; color: white; border-radius: 4px; text-align: center; font-weight: bold;'
     elif pos <= 6: return 'background-color: #86C024; color: white; border-radius: 4px; text-align: center; font-weight: bold;'
     elif pos <= 12: return 'background-color: #3498DB; color: white; border-radius: 4px; text-align: center; font-weight: bold;'
@@ -176,6 +194,7 @@ def style_position(pos):
     else: return 'background-color: #333333; color: white; border-radius: 4px; text-align: center; font-weight: bold;'
 
 def page_standings(client, competition_id):
+    """Renderiza a aba de Classificação, incluindo a tabela e as regras."""
     st.markdown("<div class='table-title'>Classificação Brasileirão Série A</div>", unsafe_allow_html=True)
     with st.spinner("Carregando classificação..."):
         standings = client.get_standings(competition_id)
@@ -189,7 +208,7 @@ def page_standings(client, competition_id):
             styler = standings_display.style.apply(lambda s: s.map(style_position), subset=['Pos'])
             styler = styler.format({'Time': None}).hide(axis="index")
             st.markdown(
-                f"<div class='standings-table-container'>{styler.to_html(escape=False)}</div>", 
+                f"<div class='standings-table-container'>{styler.to_html(escape=False)}</div>",
                 unsafe_allow_html=True
             )
             st.markdown("""
@@ -212,53 +231,46 @@ def page_standings(client, competition_id):
 
 
 # -----------------------------------------------------------------------------
-# PÁGINA DE ANÁLISE DE TIMES (Layout modificado + Correção de H2H)
+# Renderização: Página de Análise de Times
 # -----------------------------------------------------------------------------
 def page_team_analysis(client, competition_id):
+    """Renderiza a aba de Análise de Times (H2H e partidas recentes)."""
     st.header("Análise de Times (Confronto Direto)", anchor=False)
-    
+
     with st.spinner("Carregando times..."):
         standings = client.get_standings(competition_id)
-    
+
     if standings.empty:
         st.warning("Não foi possível carregar os times.")
         return
 
-    # Dicionários para busca rápida
     team_dict = pd.Series(standings.id.values, index=standings.Time).to_dict()
     team_crests = pd.Series(standings.Club.values, index=standings.Time).to_dict()
-    
+
     col1, col2 = st.columns(2)
     with col1:
         team1_name = st.selectbox("Selecione o Time 1", options=standings['Time'], index=0)
     with col2:
         team2_name = st.selectbox("Selecione o Time 2", options=standings['Time'], index=1)
-        
+
     if st.button("Analisar Confronto", use_container_width=True):
         if team1_name == team2_name:
             st.error("Por favor, selecione dois times diferentes.")
         else:
             team1_id = team_dict[team1_name]
             team2_id = team_dict[team2_name]
-            
-            # Busca os dados das APIs
+
             with st.spinner("Analisando confrontos e partidas dos times..."):
-                # 1. Busca o H2H (AGORA CORRIGIDO, graças à mudança no client)
                 h2h_matches_raw = client.get_head2head(team1_id, team2_id)
-                
-                # 2. Busca partidas recentes de cada time
                 team1_matches_df = client.get_team_matches(team1_id)
                 team2_matches_df = client.get_team_matches(team2_id)
-            
-            # --- 1. Calcular Estatísticas do H2H (Lógica de contagem inalterada, mas dados de entrada estão corrigidos) ---
+
+            # Calcular Estatísticas do H2H
             wins_team1, wins_team2, draws = 0, 0, 0
-            
-            # Filtramos APENAS os jogos finalizados ANTES da contagem
             finished_h2h = [m for m in h2h_matches_raw if m['status'] == 'FINISHED']
-            
+
             if finished_h2h:
-                # Iteramos sobre a lista filtrada
-                for match in finished_h2h: 
+                for match in finished_h2h:
                     if match['score']['winner'] == 'HOME_TEAM':
                         if match['homeTeam']['id'] == team1_id: wins_team1 += 1
                         else: wins_team2 += 1
@@ -267,80 +279,57 @@ def page_team_analysis(client, competition_id):
                         else: wins_team2 += 1
                     elif match['score']['winner'] == 'DRAW':
                         draws += 1
-            
-            # --- 2. Renderizar Cabeçalho H2H (Placar de Vitórias) (Inalterado) ---
+
+            # Renderizar Cabeçalho H2H (Placar de Vitórias)
             crest1 = team_crests.get(team1_name, "")
             crest2 = team_crests.get(team2_name, "")
 
             c1, c2, c3, c4, c5 = st.columns([2.5, 1, 1.5, 1, 2.5])
-            with c1:
-                st.markdown(f"<div class='team-name home'>{team1_name}</div>", unsafe_allow_html=True)
-            with c2:
-                st.image(crest1, width=36)
-            with c3:
-                # Mostra o placar de VITÓRIAS do H2H (agora correto)
-                st.markdown(f"<div class='match-score-display'>{wins_team1} x {wins_team2}</div>", unsafe_allow_html=True)
-            with c4:
-                st.image(crest2, width=36)
-            with c5:
-                st.markdown(f"<div class='team-name away'>{team2_name}</div>", unsafe_allow_html=True)
-            
+            with c1: st.markdown(f"<div class='team-name home'>{team1_name}</div>", unsafe_allow_html=True)
+            with c2: st.image(crest1, width=36)
+            with c3: st.markdown(f"<div class='match-score-display'>{wins_team1} x {wins_team2}</div>", unsafe_allow_html=True)
+            with c4: st.image(crest2, width=36)
+            with c5: st.markdown(f"<div class='team-name away'>{team2_name}</div>", unsafe_allow_html=True)
+
             total_matches = wins_team1 + wins_team2 + draws
             st.markdown(f"<div class='match-info'>Total de {total_matches} confrontos finalizados • {draws} empates</div>", unsafe_allow_html=True)
             st.divider()
 
-            # --- 3. Layout (MODIFICADO) ---
-            # As colunas (col_h2h, col_matches) foram removidas.
-            # O conteúdo da antiga 'col_h2h' (lista de H2H) foi excluído.
-            # O conteúdo da antiga 'col_matches' (abas de partidas) é renderizado em largura total.
-
+            # Abas para partidas recentes de cada time
             st.subheader("Partidas Recentes", anchor=False)
-            
-            # Abas para selecionar qual time ver
             tab_team1, tab_team2 = st.tabs([f"Partidas de {team1_name}", f"Partidas de {team2_name}"])
 
-            # Aba para o Time 1
             with tab_team1:
-                # Container rolável
-                with st.container(border=True, height=600): # Altura aumentada
+                with st.container(border=True, height=600):
                     if team1_matches_df.empty:
                         st.info(f"Nenhuma partida encontrada para {team1_name}.")
                     else:
-                        # Filtra e ordena (ex: 30 últimas partidas)
                         recent_matches_t1 = team1_matches_df.sort_values(by='Data', ascending=False).head(30)
-                        
-                        # Reutiliza a função de renderizar partidas
-                        # (Não passamos 'standings_df' para não mostrar predição aqui)
                         render_match_list(recent_matches_t1, team_crests)
-            
-            # Aba para o Time 2
+
             with tab_team2:
-                # Container rolável
-                with st.container(border=True, height=600): # Altura aumentada
+                with st.container(border=True, height=600):
                     if team2_matches_df.empty:
                         st.info(f"Nenhuma partida encontrada para {team2_name}.")
                     else:
-                        # Filtra e ordena (ex: 30 últimas partidas)
                         recent_matches_t2 = team2_matches_df.sort_values(by='Data', ascending=False).head(30)
-                        
-                        # Reutiliza a função de renderizar partidas
                         render_match_list(recent_matches_t2, team_crests)
 
 
 # -----------------------------------------------------------------------------
-# NOVO: FUNÇÃO DE PREDIÇÃO ESTATÍSTICA
+# Lógica: Predição Estatística
 # -----------------------------------------------------------------------------
 def calculate_match_prediction(home_team_name, away_team_name, standings_df):
     """
-    Calcula uma predição simples baseada na Força de Ataque/Defesa 
+    Calcula uma predição simples baseada na Força de Ataque/Defesa
     retirada da tabela de classificação (standings_df).
+    Utiliza uma abordagem baseada em Gols Esperados (xG) simplificados.
     """
     try:
         # 1. Calcular Médias da Liga
-        # Usamos J (Jogos) para normalizar. Média de gols por jogo.
         avg_goals_home = standings_df['GF'].sum() / standings_df['J'].sum()
         avg_goals_away = standings_df['GC'].sum() / standings_df['J'].sum()
-        
+
         # 2. Obter estatísticas dos times
         home_team = standings_df[standings_df['Time'] == home_team_name].iloc[0]
         away_team = standings_df[standings_df['Time'] == away_team_name].iloc[0]
@@ -348,59 +337,51 @@ def calculate_match_prediction(home_team_name, away_team_name, standings_df):
         # 3. Calcular Força de Ataque e Defesa (Gols por jogo do time / Média da liga)
         home_attack_strength = (home_team['GF'] / home_team['J']) / avg_goals_home
         home_defense_strength = (home_team['GC'] / home_team['J']) / avg_goals_away
-        
-        away_attack_strength = (away_team['GF'] / away_team['J']) / avg_goals_away # Atacando fora
-        away_defense_strength = (away_team['GC'] / away_team['J']) / avg_goals_home # Defendendo fora
+        away_attack_strength = (away_team['GF'] / away_team['J']) / avg_goals_away
+        away_defense_strength = (away_team['GC'] / away_team['J']) / avg_goals_home
 
-        # 4. Fator Casa (Um bônus de 10% para o mandante, por exemplo)
-        HOME_ADVANTAGE = 1.10 
-        
-        # 5. Calcular "Gols Esperados" (simplificado)
-        # Gols Mandante = AtaqueMandante * DefesaVisitante * VantagemCasa
-        # Gols Visitante = AtaqueVisitante * DefesaMandante
+        # 4. Calcular "Gols Esperados" (simplificado)
         exp_goals_home = home_attack_strength * away_defense_strength * HOME_ADVANTAGE
         exp_goals_away = away_attack_strength * home_defense_strength
 
-        # 6. Normalizar para Probabilidades (simplificado)
+        # 5. Normalizar para Probabilidades (simplificado)
         total_strength = exp_goals_home + exp_goals_away
-        
-        # A probabilidade de empate é inversamente proporcional à diferença de força
-        # Quanto mais próximos os Gols Esperados, maior a chance de empate.
+
+        # Probabilidade de empate é inversamente proporcional à diferença de força
         draw_prob = 1 - (abs(exp_goals_home - exp_goals_away) / total_strength)
         draw_prob = max(0.20, min(0.35, draw_prob * 0.5)) # Limita o empate entre 20-35%
 
         home_win_prob = (exp_goals_home / total_strength) * (1 - draw_prob)
         away_win_prob = (exp_goals_away / total_strength) * (1 - draw_prob)
-        
+
         # Renormaliza para somar 100%
         total_prob = home_win_prob + draw_prob + away_win_prob
-        
+
         return {
             'home': int((home_win_prob / total_prob) * 100),
             'draw': int((draw_prob / total_prob) * 100),
             'away': int((away_win_prob / total_prob) * 100)
         }
-        
+
     except (IndexError, ZeroDivisionError, KeyError):
         # Falha se o time não estiver na tabela (ex: Copa) ou jogos = 0
         return None
 
 
 # -----------------------------------------------------------------------------
-# PÁGINA DE PARTIDAS (MODIFICADA PARA PREDIÇÃO)
+# Renderização: Lista de Partidas (Componente reutilizável)
 # -----------------------------------------------------------------------------
 def render_match_list(matches_df, team_crests, standings_df=None):
     """
-    Função auxiliar para renderizar a lista de partidas no novo formato de card.
-    Agora aceita 'standings_df' para calcular predições.
+    Função auxiliar para renderizar a lista de partidas no formato de card.
+    Se 'standings_df' for fornecido, calcula e exibe as predições.
     """
-    
+
     if matches_df.empty:
         st.info("Nenhuma partida encontrada para esta seleção.")
         return
 
     for _, row in matches_df.iterrows():
-        # --- 1. Informações da Partida (Data, Estádio) ---
         try:
             data_local = row['Data'].tz_convert('America/Sao_Paulo')
             data_str = data_local.strftime('%d/%m')
@@ -410,17 +391,15 @@ def render_match_list(matches_df, team_crests, standings_df=None):
             data_str = row['Data'].strftime('%d/%m')
             dia_semana = row['Data'].strftime('%A').capitalize()
             hora_str = row['Data'].strftime('%H:%M (UTC)')
-        
+
         info_str = f"{data_str} • {dia_semana} • {hora_str}"
         
-        # Adiciona competição (se disponível) para a lista de partidas gerais
+        # Adiciona competição se for diferente do Brasileirão (ex: Copa)
         if 'Competicao' in row and row['Competicao'] != 'N/A' and row['Competicao'] != 'Campeonato Brasileiro Série A':
              info_str = f"🏆 {row['Competicao']} • {info_str}"
 
         st.markdown(f"<div class='match-info'>{info_str}</div>", unsafe_allow_html=True)
 
-
-        # --- 2. Placar (Times, Escudos, Gols) ---
         crest_home = team_crests.get(row['Mandante'], "")
         crest_away = team_crests.get(row['Visitante'], "")
 
@@ -433,30 +412,22 @@ def render_match_list(matches_df, team_crests, standings_df=None):
         else: # SCHEDULED, TIMED, POSTPONED
             score_home = " "
             score_away = " "
-            
-        # Layout: [Time Mandante] [Escudo] [Placar] [Escudo] [Time Visitante]
-        col1, col2, col3, col4, col5 = st.columns([2.5, 1, 1.5, 1, 2.5])
-        with col1:
-            st.markdown(f"<div class='team-name home'>{row['Mandante']}</div>", unsafe_allow_html=True)
-        with col2:
-            # --- CORREÇÃO AQUI ---
-            if crest_home: # Só exibe a imagem se a string não for vazia
-                st.image(crest_home, width=36)
-        with col3:
-            st.markdown(f"<div class='match-score-display'>{score_home} x {score_away}</div>", unsafe_allow_html=True)
-        with col4:
-            # --- CORREÇÃO AQUI ---
-            if crest_away: # Só exibe a imagem se a string não for vazia
-                st.image(crest_away, width=36)
-        with col5:
-            st.markdown(f"<div class='team-name away'>{row['Visitante']}</div>", unsafe_allow_html=True)
 
-    
-        # --- 3. (NOVO) MOSTRAR PREDIÇÃO ---
-        # Se o jogo está agendado E recebemos a tabela de classificação
+        # Layout do Placar: [Time Mandante] [Escudo] [Placar] [Escudo] [Time Visitante]
+        col1, col2, col3, col4, col5 = st.columns([2.5, 1, 1.5, 1, 2.5])
+        with col1: st.markdown(f"<div class='team-name home'>{row['Mandante']}</div>", unsafe_allow_html=True)
+        with col2:
+            if crest_home: st.image(crest_home, width=36)
+        with col3: st.markdown(f"<div class='match-score-display'>{score_home} x {score_away}</div>", unsafe_allow_html=True)
+        with col4:
+            if crest_away: st.image(crest_away, width=36)
+        with col5: st.markdown(f"<div class='team-name away'>{row['Visitante']}</div>", unsafe_allow_html=True)
+
+
+        # Mostra a barra de predição se o jogo estiver agendado e os dados existirem
         if row['Status'] in ('SCHEDULED', 'TIMED') and standings_df is not None:
             prediction = calculate_match_prediction(row['Mandante'], row['Visitante'], standings_df)
-            
+
             if prediction:
                 st.markdown(f"""
                 <div class="prediction-bar-container">
@@ -470,14 +441,12 @@ def render_match_list(matches_df, team_crests, standings_df=None):
                     <div class="bar-away" style="width: {prediction['away']}%;"></div>
                 </div>
                 """, unsafe_allow_html=True)
-        
-        # --- 4. Divisor ---
+
         st.divider()
 
 
 def page_matches(client, competition_id):
-    # st.header("🗓️ Jogos", anchor=False) 
-    
+    """Renderiza a aba de Jogos, com o seletor de rodadas."""
     with st.spinner("Carregando calendário de partidas..."):
         all_matches = client.get_matches(competition_id)
     if all_matches.empty:
@@ -496,20 +465,22 @@ def page_matches(client, competition_id):
     if not rodadas:
          st.warning("Nenhuma rodada numerada encontrada.")
          return
-    
+
+    # Define a rodada padrão ao carregar a página
     if 'rodada_select' not in st.session_state:
         today = pd.Timestamp.now(tz='UTC')
         next_matches = all_matches[(all_matches['Data'] > today) & (all_matches['Rodada'] > 0)].sort_values(by='Data')
-        
+
         default_rodada = rodadas[0]
         if not next_matches.empty:
             default_rodada_candidate = int(next_matches.iloc[0]['Rodada'])
             if default_rodada_candidate in rodadas:
                 default_rodada = default_rodada_candidate
         elif all_matches['Status'].str.contains('FINISHED').any():
-             default_rodada = rodadas[-1] 
+             default_rodada = rodadas[-1] # Se não há jogos futuros, mostra a última
         st.session_state.rodada_select = default_rodada
 
+    # Funções de callback para os botões de rodada
     def prev_rodada():
         try:
             current_index = rodadas.index(st.session_state.rodada_select)
@@ -517,7 +488,7 @@ def page_matches(client, competition_id):
                 st.session_state.rodada_select = rodadas[current_index - 1]
         except ValueError:
             st.session_state.rodada_select = rodadas[0]
-    
+
     def next_rodada():
         try:
             current_index = rodadas.index(st.session_state.rodada_select)
@@ -526,39 +497,40 @@ def page_matches(client, competition_id):
         except ValueError:
             st.session_state.rodada_select = rodadas[0]
 
+    # Renderiza o seletor de rodada
     col_prev, col_select, col_next = st.columns([1, 4, 1])
     with col_prev:
         st.button("◀️", use_container_width=True, on_click=prev_rodada, key="prev_rodada_btn_new")
     with col_select:
         rodada_display = f"{st.session_state.rodada_select}ª RODADA"
-        # --- BUG DE HTML CORRIGIDO AQUI ---
         st.markdown(f"<div class='rodada-header'>{rodada_display}</div>", unsafe_allow_html=True)
     with col_next:
         st.button("▶️", use_container_width=True, on_click=next_rodada, key="next_rodada_btn_new")
-    
+
     st.divider()
 
+    # Filtra e renderiza as partidas da rodada selecionada
     selected_rodada = st.session_state.rodada_select
     matches_filtered = all_matches[all_matches['Rodada'] == selected_rodada].sort_values(by='Data')
     
-    # --- MODIFICADO AQUI ---
-    # Passamos 'standings' (a tabela de classificação) para que as predições possam ser calculadas
+    # Passa 'standings' para permitir o cálculo de predições
     render_match_list(matches_filtered, team_crests, standings)
 
 
 # -----------------------------------------------------------------------------
-# PÁGINA DE ESTATÍSTICAS (Sem alterações)
+# Renderização: Página de Estatísticas
 # -----------------------------------------------------------------------------
 def page_statistics(client, competition_id):
+    """Renderiza a aba de Estatísticas Detalhadas (Jogadores e Times)."""
     st.header("📈 Estatísticas Detalhadas", anchor=False)
-    
+
     tab_players, tab_teams = st.tabs(["Estatísticas de Jogadores", "Estatísticas de Times"])
 
     with tab_players:
         st.subheader("Líderes de Estatísticas (Jogadores)", anchor=False)
         with st.spinner("Carregando estatísticas dos jogadores..."):
             scorers_data = client.get_scorers(competition_id)
-        
+
         if scorers_data.empty:
             st.warning("Não foi possível carregar as estatísticas dos jogadores.")
         else:
@@ -569,38 +541,39 @@ def page_statistics(client, competition_id):
             sort_by = st.selectbox("Ordenar por (Jogadores):", options=metric_options.keys(), index=0)
             sorted_data = scorers_data.sort_values(by=metric_options[sort_by], ascending=False).reset_index(drop=True)
             st.dataframe(sorted_data, hide_index=True, use_container_width=True)
-        
+
     with tab_teams:
         st.subheader("Líderes de Estatísticas (Times)", anchor=False)
         with st.spinner("Carregando estatísticas dos times..."):
             standings_data = client.get_standings(competition_id)
-        
+
         if standings_data.empty:
             st.warning("Não foi possível carregar as estatísticas dos times.")
         else:
             team_stats = standings_data[['Time', 'J', 'V', 'E', 'D', 'GF', 'GC', 'SG', 'P']]
             team_metric_options = {
-                'Pontuação (Classificação)': ('P', False), 
+                'Pontuação (Classificação)': ('P', False),
                 'Melhor Ataque (Gols Marcados)': ('GF', False),
-                'Melhor Defesa (Gols Sofridos)': ('GC', True),   
-                'Pior Ataque (Gols Marcados)': ('GF', True),    
-                'Pior Defesa (Gols Sofridos)': ('GC', False),  
+                'Melhor Defesa (Gols Sofridos)': ('GC', True),
+                'Pior Ataque (Gols Marcados)': ('GF', True),
+                'Pior Defesa (Gols Sofridos)': ('GC', False),
                 'Mais Vitórias': ('V', False),
                 'Mais Empates': ('E', False),
                 'Mais Derrotas': ('D', False)
             }
-            
+
             team_sort_by = st.selectbox("Ordenar por (Times):", options=team_metric_options.keys(), index=0)
-            
+
             sort_col, ascending = team_metric_options[team_sort_by]
             sorted_teams = team_stats.sort_values(by=sort_col, ascending=ascending).reset_index(drop=True)
             st.dataframe(sorted_teams, hide_index=True, use_container_width=True)
 
 # -----------------------------------------------------------------------------
-# Função para carregar o CSS (Sem alterações)
+# Setup: Carregar CSS
 # -----------------------------------------------------------------------------
 @st.cache_data
 def load_css(file_name="style.css"):
+    """Carrega um arquivo CSS local no app."""
     try:
         with open(file_name, "r", encoding="utf-8") as f:
             css = f.read()
@@ -609,12 +582,13 @@ def load_css(file_name="style.css"):
         st.error(f"Arquivo CSS '{file_name}' não encontrado.")
 
 # -----------------------------------------------------------------------------
-# Função Principal da Aplicação (Sem alterações)
+# Função Principal da Aplicação
 # -----------------------------------------------------------------------------
 def run_app():
+    """Função principal que inicializa e monta a aplicação Streamlit."""
     st.set_page_config(page_title="DataFut", layout="wide", page_icon="⚽")
-    
-    load_css("style.css") 
+
+    load_css("style.css")
 
     st.markdown(f"""
     <div class="main-header">
@@ -623,30 +597,36 @@ def run_app():
     </div>
     """, unsafe_allow_html=True)
 
-    API_KEY = "f92bd5ebc64e40bda696abc3faf52d2a" # Sua chave
-    client = FootballAPIClient(API_KEY)
-    COMPETITION_ID = "BSA"
+    # --- MELHORIA DE SEGURANÇA ---
+    # Carrega a API_KEY do sistema de 'secrets' do Streamlit.
+    # Crie um arquivo .streamlit/secrets.toml e adicione:
+    # FOOTBALL_API_KEY = "sua_chave_aqui"
+    try:
+        api_key = st.secrets["FOOTBALL_API_KEY"]
+    except (FileNotFoundError, KeyError):
+        st.error("Chave da API (FOOTBALL_API_KEY) não encontrada.")
+        st.info("Por favor, adicione sua chave ao arquivo .streamlit/secrets.toml")
+        return
+
+    client = FootballAPIClient(api_key)
 
     page_key_metrics(client, COMPETITION_ID)
 
     st.markdown("<div style='margin-top: 20px;'></div>", unsafe_allow_html=True)
-    
+
     tab1, tab2, tab3, tab4 = st.tabs([
-        "Classificação", 
-        "Análise de Times", 
-        "Jogos", 
+        "Classificação",
+        "Análise de Times",
+        "Jogos",
         "Estatísticas Detalhadas"
     ])
 
     with tab1:
         page_standings(client, COMPETITION_ID)
-
     with tab2:
         page_team_analysis(client, COMPETITION_ID)
-    
     with tab3:
         page_matches(client, COMPETITION_ID)
-        
     with tab4:
         page_statistics(client, COMPETITION_ID)
 

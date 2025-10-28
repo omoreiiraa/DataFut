@@ -55,13 +55,9 @@ h3 {
 [data-testid="stTabsPanel-1"] .stButton > button:disabled {
     
     background-color: #F0F2F6 !important; /* Era #1DB954 (Verde) */
-
     color: #31333F !important; /* Era #FFFFFF (Branco) */
-    
     font-weight: 700;
-
     border: 1px solid #E0E0E0 !important; /* Era #1DB954 (Verde) */
-    
     border-radius: 8px;
     padding: 10px 20px;
     transition: all 0.3s ease;
